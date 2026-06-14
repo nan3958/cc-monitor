@@ -32,7 +32,7 @@ VSCode 扩展**不支持 hooks**（[Issue #21736](https://github.com/anthropics/
 
 ```bash
 # 1. 克隆
-git clone https://github.com/geeling/cc-monitor ~/.local/cc-monitor
+git clone https://github.com/nan3958/cc-monitor ~/.local/cc-monitor
 cd ~/.local/cc-monitor
 
 # 2. 配置通知后端
@@ -63,7 +63,7 @@ systemctl --user stop cc-monitor     # 停止
 
 ```powershell
 # 1. 克隆
-git clone https://github.com/geeling/cc-monitor $env:USERPROFILE\.local\cc-monitor
+git clone https://github.com/nan3958/cc-monitor $env:USERPROFILE\.local\cc-monitor
 cd $env:USERPROFILE\.local\cc-monitor
 
 # 2. 配置通知后端
