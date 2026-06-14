@@ -2,113 +2,100 @@
 """cc-monitor: 监控 Claude Code 会话状态，检测空闲/等待并推送通知。
 
 跨平台支持：Linux / macOS / Windows
-用法:
-  cc-monitor.py                           # 默认
-  CC_MONITOR_NOTIFY=/path/to/notify.sh cc-monitor.py  # 指定通知脚本
-  cc-monitor.py --install                 # 安装后台服务
-  cc-monitor.py --test                    # 测试通知链路
 """
 
-import json, os, re, select, subprocess, sys, time, platform
+import json, os, re, subprocess, sys, time, platform, queue, threading
 from datetime import datetime
 from pathlib import Path
 
-# ---- 通知脚本查找 ----
-NOTIFY_SCRIPT = os.environ.get("CC_MONITOR_NOTIFY",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify.sh"))
+# ---- 通知脚本 ----
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_default_notify = os.path.join(_script_dir, "notify.sh")
+# Windows 上优先用 notify.py（避免 CMD 弹窗）
+if platform.system() == "Windows":
+    _py_notify = os.path.join(_script_dir, "notify.py")
+    if os.path.exists(_py_notify):
+        _default_notify = _py_notify
+NOTIFY_SCRIPT = os.environ.get("CC_MONITOR_NOTIFY", _default_notify)
 
 # ---- 跨平台 VSCode 日志路径 ----
-def _find_vscode_logs() -> list[Path]:
-    """返回可能的 VSCode 日志目录列表"""
+def _find_vscode_dirs() -> list[Path]:
     home = Path.home()
     candidates = []
     system = platform.system()
-
     if system == "Windows":
-        # Windows 本地 VSCode
         appdata = os.environ.get("APPDATA", "")
         if appdata:
             candidates.append(Path(appdata) / "Code" / "logs")
-        # VSCode Remote Server (SSH 到 Linux 时 Windows 端也会有)
         candidates.append(home / ".vscode-server" / "data" / "logs")
     elif system == "Darwin":
         candidates.append(home / "Library" / "Application Support" / "Code" / "logs")
         candidates.append(home / ".vscode-server" / "data" / "logs")
-    else:  # Linux
+    else:
         candidates.append(home / ".vscode-server" / "data" / "logs")
-        # 桌面版 VSCode
         candidates.append(home / ".config" / "Code" / "logs")
-
     return [d for d in candidates if d.exists()]
 
-def find_latest_log() -> Path | None:
-    """在所有 VSCode 日志目录中找到最新的 Claude VSCode.log"""
+def find_all_logs() -> list[Path]:
+    """返回当前活跃的 Claude VSCode.log 文件（只看最近的日期目录）"""
     all_logs = []
-    for base in _find_vscode_logs():
-        for log_dir in base.iterdir():
-            if not log_dir.is_dir():
-                continue
+    for base in _find_vscode_dirs():
+        date_dirs = sorted([d for d in base.iterdir() if d.is_dir()], reverse=True)
+        for log_dir in date_dirs[:2]:  # 只看最近 2 个日期目录
             for match in log_dir.glob("**/exthost*/Anthropic.claude-code/Claude VSCode.log"):
                 all_logs.append(match)
-    if all_logs:
-        all_logs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return all_logs[0]
-    return None
+    return sorted(all_logs, key=lambda p: p.stat().st_mtime, reverse=True)
 
-# ---- Python 版 tail -F（替代系统 tail，跨平台） ----
+# ---- tail -F（跨平台） ----
 def follow_file(path: Path):
-    """生成器：持续 yield 文件的新行，自动处理 logrotate"""
     f = open(path, 'r', encoding='utf-8', errors='replace')
-    # 跳到文件末尾
     f.seek(0, 2)
     ino = os.fstat(f.fileno()).st_ino
-
     while True:
-        # 检查 inode 是否变化（logrotate: 旧文件被重命名/删除）
         try:
             cur_ino = os.stat(str(path)).st_ino
         except FileNotFoundError:
             cur_ino = None
-
         if cur_ino != ino:
-            # 文件被轮转，重新打开
             f.close()
             f = open(path, 'r', encoding='utf-8', errors='replace')
             ino = os.fstat(f.fileno()).st_ino
-
         line = f.readline()
         if line:
             yield line
         else:
-            # 文件可能被 truncate 了
             if os.stat(str(path)).st_size < f.tell():
                 f.seek(0, 2)
-            time.sleep(0.5)  # 没有新数据时等待
+            time.sleep(0.5)
 
 # ---- 状态监控核心 ----
 IDLE_CONFIRM, DEBOUNCE_IDLE = 5, 120
 WAITING_CONFIRM, DEBOUNCE_WAITING = 8, 60
+FAIL_RETRY_DEBOUNCE = 60  # 通知失败后的重试间隔
 SESSION_TTL = 7200
 
 sessions: dict = {}
-_notify_ok = True  # 通知脚本可用标志
+_log_file = None
+
+def _log(msg: str):
+    ts = datetime.now()
+    print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
+    if _log_file:
+        print(f"[{ts}] {msg}", file=_log_file, flush=True)
 
 def send_notify(evt: str, title: str) -> bool:
-    global _notify_ok
-    if not _notify_ok:
-        return False
     try:
-        r = subprocess.run([NOTIFY_SCRIPT, evt, title],
-            timeout=10, capture_output=True, text=True)
-        if r.returncode != 0 and "No notification backend" in (r.stdout + r.stderr):
-            _notify_ok = False
+        if NOTIFY_SCRIPT.endswith('.py'):
+            cmd = [sys.executable, NOTIFY_SCRIPT, evt, title]
+        else:
+            cmd = [NOTIFY_SCRIPT, evt, title]
+        r = subprocess.run(cmd, timeout=10, capture_output=True, text=True)
         return r.returncode == 0
     except FileNotFoundError:
-        print(f"[{datetime.now()}] WARN: notify script not found: {NOTIFY_SCRIPT}", file=sys.stderr)
-        _notify_ok = False
+        _log(f"WARN: notify script not found: {NOTIFY_SCRIPT}")
         return False
     except Exception as e:
-        print(f"[{datetime.now()}] notify error: {e}", file=sys.stderr)
+        _log(f"notify error: {e}")
         return False
 
 def parse_state(line: str) -> dict | None:
@@ -129,7 +116,7 @@ def on_state(sid: str, state: str, title: str):
         return
     e = sessions[sid]
     if state == e["state"]: return
-    print(f"[{datetime.now()}] STATE: {e['state']} -> {state}  ({title[:50]})", file=sys.stderr, flush=True)
+    _log(f"STATE: {e['state']} -> {state}  ({title[:50]})")
     e["state"] = state; e["since"] = now
     if title: e["title"] = title
     if state == "running" and e.get("running_since", 0) == 0:
@@ -142,19 +129,44 @@ def check_notify():
         if now - e["since"] > SESSION_TTL: stale.append(sid); continue
         dur = now - e["since"]
         title = e.get("title", "")[:60]
-        if e["state"] == "idle" and dur >= IDLE_CONFIRM and (now - e["last_idle"] > DEBOUNCE_IDLE):
-            label = f"VSCode: {title}" if title else "VSCode Claude 任务完成"
-            if send_notify("done", label):
-                e["last_idle"] = now; e["running_since"] = 0
-                print(f"[{datetime.now()}] NOTIFY done: {label}", file=sys.stderr, flush=True)
-        elif e["state"] == "waiting_input" and dur >= WAITING_CONFIRM and (now - e["last_waiting"] > DEBOUNCE_WAITING):
-            label = f"VSCode: {title}" if title else "VSCode Claude 需要关注"
-            if send_notify("permission", label):
+        if e["state"] == "idle" and dur >= IDLE_CONFIRM:
+            debounce_ok = (now - e["last_idle"] > DEBOUNCE_IDLE)
+            retry_ok = (now - e["last_idle"] > FAIL_RETRY_DEBOUNCE and e["last_idle"] > 0)
+            if debounce_ok or retry_ok:
+                label = f"VSCode: {title}" if title else "VSCode Claude 任务完成"
+                ok = send_notify("done", label)
+                e["last_idle"] = now
+                if ok:
+                    e["running_since"] = 0
+                    _log(f"NOTIFY done: {label}")
+                else:
+                    _log(f"NOTIFY done FAILED (will retry in {FAIL_RETRY_DEBOUNCE}s): {label}")
+        elif e["state"] == "waiting_input" and dur >= WAITING_CONFIRM:
+            debounce_ok = (now - e["last_waiting"] > DEBOUNCE_WAITING)
+            retry_ok = (now - e["last_waiting"] > FAIL_RETRY_DEBOUNCE and e["last_waiting"] > 0)
+            if debounce_ok or retry_ok:
+                label = f"VSCode: {title}" if title else "VSCode Claude 需要关注"
+                ok = send_notify("permission", label)
                 e["last_waiting"] = now
-                print(f"[{datetime.now()}] NOTIFY waiting: {label}", file=sys.stderr, flush=True)
+                if ok:
+                    _log(f"NOTIFY waiting: {label}")
+                else:
+                    _log(f"NOTIFY waiting FAILED (will retry in {FAIL_RETRY_DEBOUNCE}s): {label}")
     for sid in stale: del sessions[sid]
 
+# ---- 主循环 ----
+_line_queue: queue.Queue = queue.Queue()
+
+def _watch_file(path: Path):
+    try:
+        for line in follow_file(path):
+            _line_queue.put(line)
+    except Exception as e:
+        _log(f"watcher died: {path} — {e}")
+        _line_queue.put(None)
+
 def main():
+    global _log_file
     if "--test" in sys.argv:
         print("Testing notify...")
         ok = send_notify("custom", "cc-monitor 测试消息")
@@ -165,40 +177,50 @@ def main():
         install_service()
         return
 
-    print(f"[{datetime.now()}] cc-monitor starting ({platform.system()})", file=sys.stderr, flush=True)
-    print(f"[{datetime.now()}] notify: {NOTIFY_SCRIPT}", file=sys.stderr, flush=True)
+    # 文件日志
+    _log_file = open(os.path.join(_script_dir, "cc-monitor.log"), 'a', encoding='utf-8')
+    _log(f"cc-monitor starting ({platform.system()})")
+    _log(f"notify: {NOTIFY_SCRIPT}")
 
-    log = find_latest_log()
-    if not log:
-        print(f"[{datetime.now()}] ERROR: no Claude VSCode log found. Searched:", file=sys.stderr)
-        for d in _find_vscode_logs():
-            print(f"  - {d}", file=sys.stderr)
-        sys.exit(1)
+    _start_watching()
+    last_rescan = time.time()
 
-    print(f"[{datetime.now()}] watching: {log}", file=sys.stderr, flush=True)
-    last_rotate_check = time.time()
+    while True:
+        try:
+            line = _line_queue.get(timeout=1)
+        except queue.Empty:
+            check_notify()
+            now = time.time()
+            if now - last_rescan > 120:
+                _start_watching()
+                last_rescan = now
+            continue
 
-    for line in follow_file(log):
-        now = time.time()
-        # 每 60s 检查日志轮转
-        if now - last_rotate_check > 60:
-            new_log = find_latest_log()
-            if new_log and new_log != log:
-                print(f"[{datetime.now()}] rotated: {log} -> {new_log}", file=sys.stderr)
-                log = new_log
-                break  # 跳出当前 follow，重新进入
-            last_rotate_check = now
+        if line is None:
+            _start_watching()
+            last_rescan = time.time()
+            continue
 
         p = parse_state(line)
-        if p: on_state(p["sid"], p["state"], p["title"])
+        if p:
+            on_state(p["sid"], p["state"], p["title"])
         check_notify()
 
-    # 轮转后重新进入
-    if log:
-        main()
+_watching: set = set()
+
+def _start_watching():
+    """启动所有日志文件的 watcher 线程"""
+    global _watching
+    logs = find_all_logs()
+    for log in logs:
+        if log in _watching:
+            continue
+        _watching.add(log)
+        t = threading.Thread(target=_watch_file, args=(log,), daemon=True)
+        t.start()
+        _log(f"watching: {log}")
 
 def install_service():
-    """安装后台服务"""
     script = os.path.abspath(__file__)
     system = platform.system()
 
@@ -223,7 +245,7 @@ WantedBy=default.target"""
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "--user", "enable", "cc-monitor"], check=True)
         subprocess.run(["systemctl", "--user", "start", "cc-monitor"], check=True)
-        print("systemd service installed. Manage: systemctl --user status/restart/stop cc-monitor")
+        print("systemd service installed.")
 
     elif system == "Darwin":
         plist = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -241,17 +263,15 @@ WantedBy=default.target"""
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(plist)
         subprocess.run(["launchctl", "load", str(plist_path)], check=True)
-        print("launchd service installed. Manage: launchctl unload/load " + str(plist_path))
+        print("launchd service installed.")
 
     elif system == "Windows":
-        print("Windows: use Task Scheduler or nssm to run:")
-        print(f"  {sys.executable} {script}")
-        print("Or add a scheduled task:")
-        print(f'  schtasks /create /tn cc-monitor /tr "{sys.executable} {script}" /sc onlogon /rl highest')
+        pythonw = sys.executable.replace('python.exe', 'pythonw.exe')
+        print("Windows: run this in admin PowerShell:")
+        print(f'  schtasks /create /tn cc-monitor /tr "{pythonw} -X utf8 {script}" /sc onlogon /rl highest /f')
 
     else:
         print(f"Unknown platform: {system}")
-        print(f"Run manually: {sys.executable} {script}")
 
 if __name__ == "__main__":
     main()
