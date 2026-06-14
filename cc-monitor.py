@@ -58,7 +58,7 @@ def find_latest_log() -> Path | None:
 # ---- Python 版 tail -F（替代系统 tail，跨平台） ----
 def follow_file(path: Path):
     """生成器：持续 yield 文件的新行，自动处理 logrotate"""
-    f = open(path, 'r')
+    f = open(path, 'r', encoding='utf-8', errors='replace')
     # 跳到文件末尾
     f.seek(0, 2)
     ino = os.fstat(f.fileno()).st_ino
@@ -73,7 +73,7 @@ def follow_file(path: Path):
         if cur_ino != ino:
             # 文件被轮转，重新打开
             f.close()
-            f = open(path, 'r')
+            f = open(path, 'r', encoding='utf-8', errors='replace')
             ino = os.fstat(f.fileno()).st_ino
 
         line = f.readline()
