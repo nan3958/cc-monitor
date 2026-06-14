@@ -48,7 +48,7 @@ def find_latest_log() -> Path | None:
         for log_dir in base.iterdir():
             if not log_dir.is_dir():
                 continue
-            for match in log_dir.glob("exthost*/Anthropic.claude-code/Claude VSCode.log"):
+            for match in log_dir.glob("**/exthost*/Anthropic.claude-code/Claude VSCode.log"):
                 all_logs.append(match)
     if all_logs:
         all_logs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
