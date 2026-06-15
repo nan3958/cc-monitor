@@ -4,16 +4,24 @@
 配置: ~/.config/cc-monitor/config (key=value 格式)
 """
 
-import json, os, sys, time, urllib.request
+import json, os, sys, time, urllib.request, platform
 from pathlib import Path
 
 # Windows 默认 GBK 会导致 emoji 编码失败，强制 UTF-8
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-CONFIG_FILE = Path.home() / ".config" / "cc-monitor" / "config"
-TOKEN_FILE = Path("/tmp/cc-monitor-feishu-token")
-DEBOUNCE_DIR = Path("/tmp/cc-monitor-debounce")
+# 服务以 SYSTEM 运行时 Path.home() 指向错误路径，Windows 上始终用用户目录
+if platform.system() == "Windows":
+    _USER_HOME = Path("C:/Users/Nan")
+    CONFIG_FILE = _USER_HOME / ".config" / "cc-monitor" / "config"
+    _TMP = _USER_HOME / "AppData" / "Local" / "Temp"
+    TOKEN_FILE = _TMP / "cc-monitor-feishu-token"
+    DEBOUNCE_DIR = _TMP / "cc-monitor-debounce"
+else:
+    CONFIG_FILE = Path.home() / ".config" / "cc-monitor" / "config"
+    TOKEN_FILE = Path("/tmp/cc-monitor-feishu-token")
+    DEBOUNCE_DIR = Path("/tmp/cc-monitor-debounce")
 
 def load_config():
     cfg = {}
