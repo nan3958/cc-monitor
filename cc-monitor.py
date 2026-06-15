@@ -27,6 +27,10 @@ def _find_vscode_dirs() -> list[Path]:
         appdata = os.environ.get("APPDATA", "")
         if appdata:
             candidates.append(Path(appdata) / "Code" / "logs")
+        # 以 SYSTEM 服务运行时 APPDATA 指向 SYSTEM 而非用户，始终追加用户路径
+        user_logs = Path("C:/Users/Nan/AppData/Roaming/Code/logs")
+        if user_logs.exists() and user_logs not in candidates:
+            candidates.append(user_logs)
         candidates.append(home / ".vscode-server" / "data" / "logs")
     elif system == "Darwin":
         candidates.append(home / "Library" / "Application Support" / "Code" / "logs")
@@ -86,10 +90,12 @@ def _log(msg: str):
 def send_notify(evt: str, title: str) -> bool:
     try:
         if NOTIFY_SCRIPT.endswith('.py'):
-            cmd = [sys.executable, NOTIFY_SCRIPT, evt, title]
+            # 必须用 python.exe 而非 pythonw.exe，否则子进程网络请求会卡死
+            py = sys.executable.replace('pythonw.exe', 'python.exe')
+            cmd = [py, '-X', 'utf8', NOTIFY_SCRIPT, evt, title]
         else:
             cmd = [NOTIFY_SCRIPT, evt, title]
-        r = subprocess.run(cmd, timeout=10, capture_output=True, text=True)
+        r = subprocess.run(cmd, timeout=30, capture_output=True, text=True, encoding='utf-8', errors='replace')
         return r.returncode == 0
     except FileNotFoundError:
         _log(f"WARN: notify script not found: {NOTIFY_SCRIPT}")
