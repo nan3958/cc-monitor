@@ -189,7 +189,8 @@ def _watch_file(path: Path):
         for line in follow_file(path):
             _line_queue.put(line)
     except Exception as e:
-        _log(f"watcher died: {path} — {e}")
+        import traceback
+        _log(f"watcher CRASH: {path} — {e}\n{traceback.format_exc()}")
         _line_queue.put(None)
 
 def main():
@@ -211,6 +212,7 @@ def main():
 
     _start_watching()
     last_rescan = time.time()
+    last_heartbeat = time.time()
 
     while True:
         try:
@@ -218,6 +220,10 @@ def main():
         except queue.Empty:
             check_notify()
             now = time.time()
+            # 每 5 分钟心跳日志
+            if now - last_heartbeat > 300:
+                _log(f"heartbeat: watching {len(_watching)} files, {len(sessions)} sessions")
+                last_heartbeat = now
             if now - last_rescan > 120:
                 _start_watching()
                 last_rescan = now
