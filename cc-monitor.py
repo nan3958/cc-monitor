@@ -118,13 +118,17 @@ def on_state(sid: str, state: str, title: str):
     now = time.time()
     if sid not in sessions:
         sessions[sid] = {"state": state, "since": now, "title": title,
-                         "last_idle": 0, "last_waiting": 0, "running_since": 0}
+                         "last_idle": 0, "last_waiting": 0, "running_since": 0,
+                         "notified_idle": False, "notified_waiting": False}
         return
     e = sessions[sid]
     if state == e["state"]: return
     _log(f"STATE: {e['state']} -> {state}  ({title[:50]})")
     e["state"] = state; e["since"] = now
     if title: e["title"] = title
+    # 状态变化，重置通知标记
+    e["notified_idle"] = False
+    e["notified_waiting"] = False
     if state == "running" and e.get("running_since", 0) == 0:
         e["running_since"] = now
 
@@ -135,29 +139,46 @@ def check_notify():
         if now - e["since"] > SESSION_TTL: stale.append(sid); continue
         dur = now - e["since"]
         title = e.get("title", "")[:60]
-        if e["state"] == "idle" and dur >= IDLE_CONFIRM:
-            debounce_ok = (now - e["last_idle"] > DEBOUNCE_IDLE)
-            retry_ok = (now - e["last_idle"] > FAIL_RETRY_DEBOUNCE and e["last_idle"] > 0)
-            if debounce_ok or retry_ok:
+        if e["state"] == "idle" and dur >= IDLE_CONFIRM and not e["notified_idle"]:
+            label = f"VSCode: {title}" if title else "VSCode Claude 任务完成"
+            ok = send_notify("done", label)
+            e["last_idle"] = now
+            if ok:
+                e["notified_idle"] = True
+                e["running_since"] = 0
+                _log(f"NOTIFY done: {label}")
+            else:
+                _log(f"NOTIFY done FAILED (will retry in {FAIL_RETRY_DEBOUNCE}s): {label}")
+        elif e["state"] == "idle" and e["last_idle"] > 0 and not e["notified_idle"]:
+            # 上次通知失败，重试
+            if now - e["last_idle"] > FAIL_RETRY_DEBOUNCE:
                 label = f"VSCode: {title}" if title else "VSCode Claude 任务完成"
                 ok = send_notify("done", label)
                 e["last_idle"] = now
                 if ok:
-                    e["running_since"] = 0
-                    _log(f"NOTIFY done: {label}")
+                    e["notified_idle"] = True
+                    _log(f"NOTIFY done (retry OK): {label}")
                 else:
-                    _log(f"NOTIFY done FAILED (will retry in {FAIL_RETRY_DEBOUNCE}s): {label}")
-        elif e["state"] == "waiting_input" and dur >= WAITING_CONFIRM:
-            debounce_ok = (now - e["last_waiting"] > DEBOUNCE_WAITING)
-            retry_ok = (now - e["last_waiting"] > FAIL_RETRY_DEBOUNCE and e["last_waiting"] > 0)
-            if debounce_ok or retry_ok:
+                    _log(f"NOTIFY done FAILED again: {label}")
+        elif e["state"] == "waiting_input" and dur >= WAITING_CONFIRM and not e["notified_waiting"]:
+            label = f"VSCode: {title}" if title else "VSCode Claude 需要关注"
+            ok = send_notify("permission", label)
+            e["last_waiting"] = now
+            if ok:
+                e["notified_waiting"] = True
+                _log(f"NOTIFY waiting: {label}")
+            else:
+                _log(f"NOTIFY waiting FAILED (will retry in {FAIL_RETRY_DEBOUNCE}s): {label}")
+        elif e["state"] == "waiting_input" and e["last_waiting"] > 0 and not e["notified_waiting"]:
+            if now - e["last_waiting"] > FAIL_RETRY_DEBOUNCE:
                 label = f"VSCode: {title}" if title else "VSCode Claude 需要关注"
                 ok = send_notify("permission", label)
                 e["last_waiting"] = now
                 if ok:
-                    _log(f"NOTIFY waiting: {label}")
+                    e["notified_waiting"] = True
+                    _log(f"NOTIFY waiting (retry OK): {label}")
                 else:
-                    _log(f"NOTIFY waiting FAILED (will retry in {FAIL_RETRY_DEBOUNCE}s): {label}")
+                    _log(f"NOTIFY waiting FAILED again: {label}")
     for sid in stale: del sessions[sid]
 
 # ---- 主循环 ----
