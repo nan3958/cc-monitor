@@ -65,8 +65,8 @@ def main():
     # 构建消息
     icons = {"start": "🚀", "done": "✅", "stop": "✅", "permission": "🔐", "error": "❌", "custom": "📢"}
     headings = {
-        "start": "Claude 开始处理", "done": "Claude 任务完成", "stop": "Claude 任务完成",
-        "permission": "Claude 需要权限确认", "error": "Claude 出现异常", "custom": ""
+        "start": "开始处理", "done": "完成", "stop": "完成",
+        "permission": "需要确认", "error": "异常", "custom": ""
     }
     if evt_type == "custom":
         title = arg1

@@ -18,6 +18,31 @@ if platform.system() == "Windows":
         _default_notify = _py_notify
 NOTIFY_SCRIPT = os.environ.get("CC_MONITOR_NOTIFY", _default_notify)
 
+# ---- 通知开关 ----
+def _load_monitor_config() -> dict:
+    """读取 cc-monitor 配置，返回开关字典（1=开, 0=关）"""
+    cfg = {}
+    config_path = None
+    if platform.system() == "Windows":
+        config_path = Path("C:/Users/Nan/.config/cc-monitor/config")
+    else:
+        config_path = Path.home() / ".config" / "cc-monitor" / "config"
+    if config_path and config_path.exists():
+        for line in config_path.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    return cfg
+
+_monitor_cfg = _load_monitor_config()
+NOTIFY_DONE = _monitor_cfg.get("NOTIFY_DONE", "1") == "1"
+NOTIFY_PERMISSION = _monitor_cfg.get("NOTIFY_PERMISSION", "1") == "1"
+NOTIFY_START = _monitor_cfg.get("NOTIFY_START", "0") == "1"
+NOTIFY_ERROR = _monitor_cfg.get("NOTIFY_ERROR", "0") == "1"
+
 # ---- 跨平台 VSCode 日志路径 ----
 def _find_vscode_dirs() -> list[Path]:
     home = Path.home()
@@ -119,7 +144,7 @@ def on_state(sid: str, state: str, title: str):
     if sid not in sessions:
         sessions[sid] = {"state": state, "since": now, "title": title,
                          "last_idle": 0, "last_waiting": 0, "running_since": 0,
-                         "notified_idle": False, "notified_waiting": False}
+                         "notified_idle": False, "notified_waiting": False, "notified_start": False}
         return
     e = sessions[sid]
     if state == e["state"]: return
@@ -129,6 +154,7 @@ def on_state(sid: str, state: str, title: str):
     # 状态变化，重置通知标记
     e["notified_idle"] = False
     e["notified_waiting"] = False
+    e["notified_start"] = False
     if state == "running" and e.get("running_since", 0) == 0:
         e["running_since"] = now
 
@@ -139,46 +165,63 @@ def check_notify():
         if now - e["since"] > SESSION_TTL: stale.append(sid); continue
         dur = now - e["since"]
         title = e.get("title", "")[:60]
+        # ---- done ----
         if e["state"] == "idle" and dur >= IDLE_CONFIRM and not e["notified_idle"]:
-            label = f"VSCode: {title}" if title else "VSCode Claude 任务完成"
-            ok = send_notify("done", label)
-            e["last_idle"] = now
-            if ok:
-                e["notified_idle"] = True
-                e["running_since"] = 0
-                _log(f"NOTIFY done: {label}")
-            else:
-                _log(f"NOTIFY done FAILED (will retry in {FAIL_RETRY_DEBOUNCE}s): {label}")
-        elif e["state"] == "idle" and e["last_idle"] > 0 and not e["notified_idle"]:
-            # 上次通知失败，重试
-            if now - e["last_idle"] > FAIL_RETRY_DEBOUNCE:
-                label = f"VSCode: {title}" if title else "VSCode Claude 任务完成"
-                ok = send_notify("done", label)
+            if NOTIFY_DONE:
+                ok = send_notify("done", title)
                 e["last_idle"] = now
                 if ok:
                     e["notified_idle"] = True
-                    _log(f"NOTIFY done (retry OK): {label}")
+                    e["running_since"] = 0
+                    _log(f"NOTIFY done: {title}")
                 else:
-                    _log(f"NOTIFY done FAILED again: {label}")
-        elif e["state"] == "waiting_input" and dur >= WAITING_CONFIRM and not e["notified_waiting"]:
-            label = f"VSCode: {title}" if title else "VSCode Claude 需要关注"
-            ok = send_notify("permission", label)
-            e["last_waiting"] = now
-            if ok:
-                e["notified_waiting"] = True
-                _log(f"NOTIFY waiting: {label}")
+                    _log(f"NOTIFY done FAILED (will retry in {FAIL_RETRY_DEBOUNCE}s): {title}")
             else:
-                _log(f"NOTIFY waiting FAILED (will retry in {FAIL_RETRY_DEBOUNCE}s): {label}")
-        elif e["state"] == "waiting_input" and e["last_waiting"] > 0 and not e["notified_waiting"]:
-            if now - e["last_waiting"] > FAIL_RETRY_DEBOUNCE:
-                label = f"VSCode: {title}" if title else "VSCode Claude 需要关注"
-                ok = send_notify("permission", label)
+                e["notified_idle"] = True
+
+        # ---- done 重试 ----
+        elif e["state"] == "idle" and e["last_idle"] > 0 and not e["notified_idle"]:
+            if NOTIFY_DONE and now - e["last_idle"] > FAIL_RETRY_DEBOUNCE:
+                ok = send_notify("done", title)
+                e["last_idle"] = now
+                if ok:
+                    e["notified_idle"] = True
+                    _log(f"NOTIFY done (retry OK): {title}")
+                else:
+                    _log(f"NOTIFY done FAILED again: {title}")
+        # ---- start ----
+        elif e["state"] == "running" and not e.get("notified_start"):
+            if NOTIFY_START and e.get("running_since", 0) > 0:
+                send_notify("start", title)
+                e["notified_start"] = True
+                _log(f"NOTIFY start: {title}")
+            else:
+                e["notified_start"] = True
+
+        # ---- permission ----
+        elif e["state"] == "waiting_input" and dur >= WAITING_CONFIRM and not e["notified_waiting"]:
+            if NOTIFY_PERMISSION:
+                ok = send_notify("permission", title)
                 e["last_waiting"] = now
                 if ok:
                     e["notified_waiting"] = True
-                    _log(f"NOTIFY waiting (retry OK): {label}")
+                    _log(f"NOTIFY waiting: {title}")
                 else:
-                    _log(f"NOTIFY waiting FAILED again: {label}")
+                    _log(f"NOTIFY waiting FAILED (will retry in {FAIL_RETRY_DEBOUNCE}s): {title}")
+            else:
+                e["notified_waiting"] = True
+
+        # ---- permission 重试 ----
+        elif e["state"] == "waiting_input" and e["last_waiting"] > 0 and not e["notified_waiting"]:
+            if NOTIFY_PERMISSION and now - e["last_waiting"] > FAIL_RETRY_DEBOUNCE:
+                ok = send_notify("permission", title)
+                e["last_waiting"] = now
+                if ok:
+                    e["notified_waiting"] = True
+                    _log(f"NOTIFY waiting (retry OK): {title}")
+                else:
+                    _log(f"NOTIFY waiting FAILED again: {title}")
+
     for sid in stale: del sessions[sid]
 
 # ---- 主循环 ----
@@ -209,6 +252,7 @@ def main():
     _log_file = open(os.path.join(_script_dir, "cc-monitor.log"), 'a', encoding='utf-8')
     _log(f"cc-monitor starting ({platform.system()})")
     _log(f"notify: {NOTIFY_SCRIPT}")
+    _log(f"switches: done={NOTIFY_DONE} permission={NOTIFY_PERMISSION} start={NOTIFY_START} error={NOTIFY_ERROR}")
 
     _start_watching()
     last_rescan = time.time()
